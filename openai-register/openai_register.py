@@ -565,6 +565,157 @@ def _sub2api_auth_headers(settings: Dict[str, Any]) -> Dict[str, str]:
     return headers
 
 
+def _sub2api_request(method: str, url: str, settings: Dict[str, Any], *, params: Dict[str, Any] | None = None, json_body: Any = None, timeout: int = 20):
+    return requests.request(
+        method=method.upper(),
+        url=url,
+        params=params,
+        json=json_body,
+        headers=_sub2api_auth_headers(settings),
+        timeout=timeout,
+    )
+
+
+def _sub2api_extract_data(resp_json: Any) -> Any:
+    if not isinstance(resp_json, dict):
+        return resp_json
+    return resp_json.get("data", resp_json)
+
+
+def _sub2api_list_accounts_by_privacy_mode(settings: Dict[str, Any], privacy_mode: str, page_size: int = 1000) -> List[Dict[str, Any]]:
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return []
+
+    url = f"{base_url}/api/v1/admin/accounts"
+    page = 1
+    items: List[Dict[str, Any]] = []
+
+    while True:
+        params = {"page": page, "page_size": page_size}
+        try:
+            resp = _sub2api_request("GET", url, settings, params=params, timeout=20)
+        except Exception as e:
+            print(f"[Sub2Api] 拉取全量账号列表异常: {e}")
+            break
+
+        if resp.status_code == 401 and not settings.get("admin_api_key") and settings.get("email") and settings.get("password"):
+            new_token = _sub2api_login(settings)
+            if new_token:
+                settings["bearer"] = new_token
+                try:
+                    resp = _sub2api_request("GET", url, settings, params=params, timeout=20)
+                except Exception as e:
+                    print(f"[Sub2Api] 拉取全量账号列表异常: {e}")
+                    break
+
+        if resp.status_code != 200:
+            print(f"[Sub2Api] 拉取全量账号列表失败 (HTTP {resp.status_code}): {resp.text[:500]}")
+            break
+
+        try:
+            payload = resp.json()
+        except Exception:
+            print(f"[Sub2Api] 拉取全量账号列表返回非 JSON: {resp.text[:500]}")
+            break
+
+        data = _sub2api_extract_data(payload) or {}
+        page_items = data.get("items") if isinstance(data, dict) else []
+        if not isinstance(page_items, list):
+            page_items = []
+        items.extend([item for item in page_items if isinstance(item, dict)])
+
+        total = _to_int(data.get("total")) if isinstance(data, dict) else 0
+        if not page_items or len(items) >= total or len(page_items) < page_size:
+            break
+        page += 1
+
+    return items
+
+
+def _sub2api_delete_account(account_id: Any, settings: Dict[str, Any]) -> bool:
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    if not base_url:
+        return False
+    try:
+        account_id = int(account_id)
+    except (TypeError, ValueError):
+        return False
+
+    url = f"{base_url}/api/v1/admin/accounts/{account_id}"
+
+    def _do_request():
+        try:
+            return _sub2api_request("DELETE", url, settings, timeout=20)
+        except Exception as e:
+            print(f"[Sub2Api] 删除账号 {account_id} 异常: {e}")
+            return None
+
+    resp = _do_request()
+    if resp is not None and resp.status_code == 401 and not settings.get("admin_api_key") and settings.get("email") and settings.get("password"):
+        new_token = _sub2api_login(settings)
+        if new_token:
+            settings["bearer"] = new_token
+            resp = _do_request()
+
+    if resp is None:
+        return False
+    if resp.status_code == 200:
+        return True
+
+    print(f"[Sub2Api] 删除账号 {account_id} 失败 (HTTP {resp.status_code}): {resp.text[:300]}")
+    return False
+
+
+def _clean_sub2api_failed_training_accounts(settings: Dict[str, Any], privacy_mode: str = "training_set_failed", delete: bool = True) -> Dict[str, Any]:
+    base_url = str(settings.get("base_url") or "").rstrip("/")
+    if not base_url:
+        print("[Sub2Api] 未提供 base_url，跳过失效账号清理")
+        return {"fetched": 0, "matched": 0, "deleted": 0, "failed": 0, "accounts": []}
+
+    accounts = _sub2api_list_accounts_by_privacy_mode(settings, privacy_mode)
+    if not accounts:
+        print("[Sub2Api] 未拉取到任何账号")
+        return {"fetched": 0, "matched": 0, "deleted": 0, "failed": 0, "accounts": []}
+
+    matched_accounts = []
+    skipped_accounts = []
+    for item in accounts:
+        extra = item.get("extra") or {}
+        mode = extra.get("privacy_mode") if isinstance(extra, dict) else None
+        row = {
+            "id": item.get("id"),
+            "name": str(item.get("name") or ""),
+            "privacy_mode": mode,
+        }
+        if mode == privacy_mode:
+            matched_accounts.append(row)
+        else:
+            skipped_accounts.append(row)
+
+    print(f"[Sub2Api] 全量拉取 {len(accounts)} 个，本地精确匹配 privacy_mode={privacy_mode} 命中 {len(matched_accounts)} 个，跳过 {len(skipped_accounts)} 个")
+    if skipped_accounts:
+        print(f"[Sub2Api] 已跳过非精确匹配账号: {json.dumps(skipped_accounts[:20], ensure_ascii=False)}")
+
+    if not delete:
+        print(f"[Sub2Api] Dry-run 模式，不执行删除。命中账号: {json.dumps(matched_accounts[:50], ensure_ascii=False)}")
+        return {"fetched": len(accounts), "matched": len(matched_accounts), "deleted": 0, "failed": 0, "accounts": matched_accounts}
+
+    deleted = 0
+    failed = 0
+    for row in matched_accounts:
+        account_id = row.get("id")
+        name = row.get("name") or ""
+        if _sub2api_delete_account(account_id, settings):
+            deleted += 1
+            print(f"[Sub2Api] 已删除账号 #{account_id} {name}")
+        else:
+            failed += 1
+
+    print(f"[Sub2Api] 清理完成：全量拉取 {len(accounts)} 个，本地精确命中 {len(matched_accounts)} 个，删除成功 {deleted} 个，失败 {failed} 个")
+    return {"fetched": len(accounts), "matched": len(matched_accounts), "deleted": deleted, "failed": failed, "accounts": matched_accounts}
+
+
 def _push_account_to_sub2api(email: str, tokens: dict, settings: Dict[str, Any]) -> bool:
     """上传 OAuth 账号到 Sub2API，优先使用 x-api-key。"""
     base_url = str(settings.get("base_url") or "").rstrip("/")
@@ -574,36 +725,33 @@ def _push_account_to_sub2api(email: str, tokens: dict, settings: Dict[str, Any])
     url = f"{base_url}/api/v1/admin/accounts"
     payload = _build_sub2api_account_payload(email, tokens, settings.get("group_ids") or [2])
 
-    def _do_request() -> tuple[int, str]:
+    def _do_request():
         try:
-            resp = requests.post(
-                url,
-                json=payload,
-                headers=_sub2api_auth_headers(settings),
-                timeout=20,
-            )
-            return resp.status_code, resp.text
+            return _sub2api_request("POST", url, settings, json_body=payload, timeout=20)
         except Exception as e:
-            return 0, str(e)
+            print(f"[Sub2Api] 上传异常: {e}")
+            return None
 
-    status, body = _do_request()
+    resp = _do_request()
 
-    # 使用 x-api-key 时不需要登录刷新；仅 bearer 模式下 401 再尝试登录一次
-    if status == 401 and not settings.get("admin_api_key") and settings.get("email") and settings.get("password"):
+    if resp is not None and resp.status_code == 401 and not settings.get("admin_api_key") and settings.get("email") and settings.get("password"):
         new_token = _sub2api_login(settings)
         if new_token:
             settings["bearer"] = new_token
-            status, body = _do_request()
+            resp = _do_request()
 
-    ok = status in (200, 201)
+    if resp is None:
+        return False
+
+    ok = resp.status_code in (200, 201)
     if ok:
-        print(f"[Sub2Api] 上传成功 (HTTP {status})")
+        print(f"[Sub2Api] 上传成功 (HTTP {resp.status_code})")
     else:
-        print(f"[Sub2Api] 上传失败 (HTTP {status}): {str(body)[:500]}")
+        print(f"[Sub2Api] 上传失败 (HTTP {resp.status_code}): {resp.text[:500]}")
     return ok
 
 
-# ========== 轻量版 CPA 维护实现（内嵌，不依赖项目包） ==========
+
 DEFAULT_MGMT_UA = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 
 def _mgmt_headers(token: str) -> dict:
@@ -1180,6 +1328,9 @@ def main():
     parser.add_argument("--sub2api-password", default=os.getenv("SUB2API_PASSWORD"), help="Sub2API 管理员密码（旧登录方式）")
     parser.add_argument("--sub2api-group-ids", default=os.getenv("SUB2API_GROUP_IDS", "2"), help="Sub2API 绑定分组，逗号分隔")
     parser.add_argument("--sub2api-upload", action="store_true", help="注册成功后自动上传到 Sub2API")
+    parser.add_argument("--sub2api-clean-training-set-failed", action="store_true", help="清理 Sub2API 中 privacy_mode=training_set_failed 的账号")
+    parser.add_argument("--sub2api-clean-only", action="store_true", help="仅执行 Sub2API 清理，不进行注册")
+    parser.add_argument("--sub2api-clean-dry-run", action="store_true", help="仅列出命中的 training_set_failed 账号，不执行删除")
     parser.add_argument("--cpa-base-url", default=os.getenv("CPA_BASE_URL"), help="CPA 基础地址")
     parser.add_argument("--cpa-token", default=os.getenv("CPA_TOKEN"), help="CPA 管理 token (Bearer)")
     parser.add_argument("--cpa-workers", type=int, default=20, help="CPA 清理并发")
@@ -1202,6 +1353,16 @@ def main():
     while True:
         count += 1
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 流程 #{count} <<<")
+
+        if args.sub2api_clean_training_set_failed:
+            _clean_sub2api_failed_training_accounts(sub2api_settings, delete=not args.sub2api_clean_dry_run)
+            if args.sub2api_clean_only:
+                if args.once:
+                    break
+                wait_time = random.randint(args.sleep_min, args.sleep_max)
+                print(f"[*] 随机休息 {wait_time} 秒...")
+                time.sleep(wait_time)
+                continue
 
         if pm:
             if args.cpa_clean:
